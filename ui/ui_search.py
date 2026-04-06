@@ -317,20 +317,13 @@ def render_search_page() -> None:
 # =============================================================================
 # MULTIPAGE NAVIGATION
 # =============================================================================
-pg_search = st.Page(render_search_page, title="Search",             icon="🔎", default=True)
-pg_labels = st.Page("pages/1_Label_Management.py", title="Label Management", icon="🏷️")
+pg_search = st.Page(render_search_page,               title="Search",             icon="🔎", default=True)
+pg_labels = st.Page("pages/1_Label_Management.py",    title="Label Management",   icon="🏷️")
+pg_eval = st.Page("pages/2_Label_Evaluation.py", title="Label Evaluation", icon="📊")
+pg_upload = st.Page("pages/3_Upload.py",              title="Upload",             icon="⬆️")
+pg_manage = st.Page("pages/4_Manage_Videos.py",       title="Manage Videos",      icon="📚")
+pg_diag   = st.Page("pages/5_System_Diagnostics.py",  title="System Diagnostics", icon="⚙️")
 
-pg_upload = st.Page("pages/2_Upload.py",            title="Upload",           icon="⬆️")
-pg_manage = st.Page("pages/3_Manage_Videos.py",     title="Manage Videos",    icon="📚")
-
-
-pg_upload = st.Page("pages/2_Upload.py", title="Upload", icon="⬆️")
-pg_manage = st.Page("pages/3_Manage_Videos.py", title="Manage Videos", icon="📚")
-
-pg_diag   = st.Page("pages/6_System_Diagnostics.py", title="System Diagnostics", icon="⚙️")
 
 st.navigation([pg_search, pg_labels, pg_upload, pg_manage, pg_eval, pg_diag]).run()
-pg_eval = st.Page("pages/5_Label_Evaluation.py", title="Label Evaluation", icon="📊")
-
-st.navigation([pg_search, pg_labels, pg_eval]).run()
 
