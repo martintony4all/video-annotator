@@ -1,6 +1,4 @@
-"""
-utils.py - Shared utilities for Video Annotation Platform
-"""
+# utils.py - Shared utilities for Video Annotation Platform
 
 import os
 import requests
@@ -1298,32 +1296,14 @@ def build_video_link(
         sep = "&" if "?" in base else "?"
         return (f"{base}{sep}t={start_sec}s", "YouTube", True)
 
-    # Box
+    # Box — properly indented block
     if "box.com" in source_lower or "boxcloud.com" in source_lower:
-        # /shared/static/{hash} — raw download URL; convert to a Box viewer page
-        # by extracting the file ID from the URL if possible, otherwise link as-is
         if "/shared/static/" in source_lower:
-            # Try to derive a viewer URL from the stored file_id in the index
-            try:
-                from urllib.parse import urlparse
-                parsed = urlparse(actual_source)
-                base   = f"{parsed.scheme}://{parsed.netloc}"
-                # Look up the file_id associated with this video in the index
-                # Fall back to linking the download URL directly — Box will
-                # show a preview page with download option for /shared/static/ links
-                # when opened in a browser (not a programmatic fetch)
-                return (actual_source, "Box", False)
-            except Exception:
-                return (actual_source, "Box", False)
-
-        # /file/{id}?s={token} — proper Box viewer link
+            return (actual_source, "Box (download)", False)
         if "/file/" in source_lower:
             return (actual_source, "Box viewer", False)
-
-        # /s/{code} — Box shared link, opens viewer in browser
         if "/s/" in source_lower:
             return (actual_source, "Box viewer", False)
-
         return (actual_source, "Box", False)
 
     # Vimeo — append fragment time marker
