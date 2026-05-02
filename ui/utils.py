@@ -1,6 +1,4 @@
-"""
-utils.py - Shared utilities for Video Annotation Platform
-"""
+# utils.py - Shared utilities for Video Annotation Platform
 
 import os
 import requests
@@ -395,21 +393,69 @@ def index_segments_direct(
         raise RuntimeError(f"Indexing failed: {str(e)}")
 
 
-def process_transcription_to_segments(transcription_data: Dict, video_id: str) -> list:
-    segments = []
-    for i, phrase in enumerate(transcription_data.get("recognizedPhrases", [])):
-        offset = phrase.get("offsetInTicks", 0) // 10000
+def process_transcription_to_segments(
+    transcription_data: Dict, video_id: str, window_ms: int = 30000
+) -> list:
+    """
+    Group recognized phrases into ~30s chunks for more substantive segments.
+    window_ms controls chunk size: 30000=30s, 45000=45s, 60000=1min.
+    Tail segments shorter than half the window are merged into the previous segment.
+    """
+    phrases = []
+    for phrase in transcription_data.get("recognizedPhrases", []):
+        offset   = phrase.get("offsetInTicks", 0) // 10000
         duration = phrase.get("durationInTicks", 0) // 10000
-        nbest = phrase.get("nBest", [])
-        text = nbest[0].get("display", "") if nbest else ""
-        segments.append({
-            "segment_id": i,
-            "video_id": video_id,
-            "text": text,
-            "start_ms": offset,
-            "end_ms": offset + duration,
-            "pred_labels": []
-        })
+        nbest    = phrase.get("nBest", [])
+        text     = nbest[0].get("display", "") if nbest else ""
+        if text.strip():
+            phrases.append({
+                "text":     text,
+                "start_ms": offset,
+                "end_ms":   offset + duration
+            })
+
+    if not phrases:
+        return []
+
+    segments      = []
+    current_texts = []
+    current_start = phrases[0]["start_ms"]
+    current_end   = phrases[0]["end_ms"]
+
+    for phrase in phrases:
+        if phrase["start_ms"] - current_start >= window_ms and current_texts:
+            segments.append({
+                "segment_id":  len(segments),
+                "video_id":    video_id,
+                "text":        " ".join(current_texts),
+                "start_ms":    current_start,
+                "end_ms":      current_end,
+                "pred_labels": []
+            })
+            current_texts = []
+            current_start = phrase["start_ms"]
+
+        current_texts.append(phrase["text"])
+        current_end = phrase["end_ms"]
+
+    # Flush final chunk — merge into previous if shorter than half the window
+    if current_texts:
+        tail_duration = current_end - current_start
+        if segments and tail_duration < window_ms // 2:
+            # Merge tail into last segment
+            last = segments[-1]
+            last["text"]   = last["text"] + " " + " ".join(current_texts)
+            last["end_ms"] = current_end
+        else:
+            segments.append({
+                "segment_id":  len(segments),
+                "video_id":    video_id,
+                "text":        " ".join(current_texts),
+                "start_ms":    current_start,
+                "end_ms":      current_end,
+                "pred_labels": []
+            })
+
     return segments
 
 # =============================================================================
@@ -530,7 +576,6 @@ def delete_video_by_id(video_id: str) -> bool:
     if not video_id or not isinstance(video_id, str):
         return False
 
-    # Get the key field name first so we can include it in the select
     try:
         schema    = get_index_schema()
         key_field = schema.get('key_field', 'id')
@@ -544,7 +589,6 @@ def delete_video_by_id(video_id: str) -> bool:
     headers    = {"api-key": SEARCH_KEY, "Content-Type": "application/json"}
     escaped_id = video_id.replace("'", "''")
 
-    # CRITICAL: include the key field in select so we can build delete actions
     payload = {
         "search": "*",
         "filter": f"video_id eq '{escaped_id}'",
@@ -835,16 +879,13 @@ def download_box_audio(
         file_id_match = re.search(r'/file/(\d+)', parsed.path)
         shared_token = qs.get('s', [None])[0]
 
-        # Build ordered list of candidate download URLs to try
         candidates = []
 
         if file_id_match and shared_token:
             file_id = file_id_match.group(1)
-            # Pattern 1: /file/{id}/content?s={token} — cleanest shared-link download
             candidates.append(
                 f"{base}/file/{file_id}/content?s={shared_token}"
             )
-            # Pattern 2: index.php legacy download endpoint
             candidates.append(
                 f"{base}/index.php"
                 f"?rm=box_download_shared_file"
@@ -852,10 +893,8 @@ def download_box_audio(
                 f"&shared_name={shared_token}"
             )
         elif "/shared/static/" in url_lower:
-            # Already a direct static download link
             candidates.append(box_url.strip())
         else:
-            # Unknown Box URL format — try as-is
             candidates.append(box_url.strip())
 
         if progress_callback:
@@ -881,14 +920,10 @@ def download_box_audio(
 
                     content_type = r.headers.get("Content-Type", "")
 
-                    # HTML response means Box is showing a login/preview page
                     if "text/html" in content_type:
-                        last_error = (
-                            f"URL returned HTML (not audio): {attempt_url}"
-                        )
-                        continue  # try next candidate
+                        last_error = f"URL returned HTML (not audio): {attempt_url}"
+                        continue
 
-                    # Determine file extension
                     ext = ".m4a"
                     ct_lower = content_type.lower()
                     if "mp3" in ct_lower or "mpeg" in ct_lower:
@@ -900,7 +935,6 @@ def download_box_audio(
                     elif "ogg" in ct_lower:
                         ext = ".ogg"
 
-                    # Content-Disposition filename takes priority
                     disposition = r.headers.get("Content-Disposition", "")
                     cd_match = re.search(r'filename=["\']?([^"\';\s]+)', disposition)
                     if cd_match:
@@ -910,7 +944,6 @@ def download_box_audio(
                                 ext = candidate_ext
                                 break
 
-                    # URL path extension overrides Content-Type
                     url_path = attempt_url.split("?")[0]
                     for candidate_ext in [".m4a", ".mp3", ".wav", ".mp4", ".webm", ".ogg"]:
                         if url_path.lower().endswith(candidate_ext):
@@ -936,7 +969,6 @@ def download_box_audio(
                 last_error = str(e)
                 continue
 
-        # All candidates failed — give the user clear instructions
         return None, (
             f"Could not download the Box file automatically ({last_error}).\n\n"
             "To get a direct download URL:\n"
@@ -1018,7 +1050,6 @@ def process_single_video(
                 media_url = sas_url
 
         elif url_type == "box":
-            # Download Box file first, then upload to Azure Blob
             import tempfile
             with tempfile.TemporaryDirectory() as tmpdir:
                 if status_text:
@@ -1042,7 +1073,6 @@ def process_single_video(
                     result["error"] = f"Upload failed: {error}"
                     return result
                 media_url = sas_url
-                # source_url stays as the original Box URL (set at top of result dict)
 
         elif url_type == "direct":
             media_url = url.strip()
@@ -1102,11 +1132,10 @@ def process_single_video(
         save_segments_to_blob(video_id, segments)
 
         try:
-            # Always store the original user-facing URL, not the SAS blob URL
             index_result = index_segments_direct(
                 video_id,
                 segments,
-                source_url=url,          # original URL preserved throughout
+                source_url=url,
                 source_type=source_type
             )
             result["url_stored"] = index_result.get('source_url_stored', False)
@@ -1139,9 +1168,6 @@ def get_box_audio_url(box_url: str) -> Tuple[Optional[str], bool]:
 
     Returns:
         (audio_url, is_embeddable)
-
-    Uses the index.php download endpoint which is known to work for shared files.
-    Falls back to /content and /shared/static patterns.
     """
     from urllib.parse import urlparse, parse_qs
 
@@ -1158,8 +1184,6 @@ def get_box_audio_url(box_url: str) -> Tuple[Optional[str], bool]:
 
         if file_id_match and shared_token:
             file_id = file_id_match.group(1)
-            # Use index.php — the same endpoint that download_box_audio uses
-            # and that we know works for shared files
             url = (
                 f"{base}/index.php"
                 f"?rm=box_download_shared_file"
@@ -1252,7 +1276,6 @@ def build_video_link(
     """
     start_sec = ms_to_seconds(start_ms)
 
-    # Resolve source URL: use passed value, or look up from index
     actual_source = None
     if source_url and isinstance(source_url, str):
         actual_source = source_url.strip() or None
@@ -1273,17 +1296,14 @@ def build_video_link(
         sep = "&" if "?" in base else "?"
         return (f"{base}{sep}t={start_sec}s", "YouTube", True)
 
-    # Box
+    # Box — properly indented block
     if "box.com" in source_lower or "boxcloud.com" in source_lower:
-        # /file/{id}?s={token} — Box viewer link, already correct for display
-        if "/file/" in source_lower:
-            return (actual_source, "Box", False)
-        # /s/{code} — Box shared folder/file link
-        if "/s/" in source_lower:
-            return (actual_source, "Box", False)
-        # /shared/static/{hash} — direct download, no viewer equivalent
         if "/shared/static/" in source_lower:
             return (actual_source, "Box (download)", False)
+        if "/file/" in source_lower:
+            return (actual_source, "Box viewer", False)
+        if "/s/" in source_lower:
+            return (actual_source, "Box viewer", False)
         return (actual_source, "Box", False)
 
     # Vimeo — append fragment time marker
@@ -1291,7 +1311,7 @@ def build_video_link(
         base = actual_source.split("#")[0].split("?")[0]
         return (f"{base}#t={start_sec}s", "Vimeo", True)
 
-    # Internal SAS / blob storage URLs — not suitable as user-facing links
+    # Internal SAS / blob storage URLs
     if (
         "blob.core.windows.net" in source_lower
         or "sig=" in actual_source
