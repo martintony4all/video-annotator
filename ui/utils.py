@@ -831,33 +831,38 @@ def download_box_audio(
         qs = parse_qs(parsed.query)
         url_lower = box_url.lower()
         base = f"{parsed.scheme}://{parsed.netloc}"
-
+        
         file_id_match = re.search(r'/file/(\d+)', parsed.path)
         shared_token = qs.get('s', [None])[0]
+
+        # Extract /s/{token} shared link token (e.g. tulane.box.com/s/abc123)
+        s_path_match = re.match(r'/s/([^/?#]+)', parsed.path)
 
         # Build ordered list of candidate download URLs to try
         candidates = []
 
         if file_id_match and shared_token:
+            # /file/{id}?s={token} viewer links
             file_id = file_id_match.group(1)
-            # Pattern 1: /file/{id}/content?s={token} — cleanest shared-link download
             candidates.append(
                 f"{base}/file/{file_id}/content?s={shared_token}"
             )
-            # Pattern 2: index.php legacy download endpoint
             candidates.append(
                 f"{base}/index.php"
                 f"?rm=box_download_shared_file"
                 f"&file_id=f_{file_id}"
                 f"&shared_name={shared_token}"
             )
+        elif s_path_match:
+            s_token = s_path_match.group(1)
+            candidates.append(f"{base}/s/{s_token}?dl=1")
+            # Fallback: try the shared/static pattern some Box accounts use
+            candidates.append(f"{base}/shared/static/{s_token}")
         elif "/shared/static/" in url_lower:
-            # Already a direct static download link
             candidates.append(box_url.strip())
         else:
-            # Unknown Box URL format — try as-is
             candidates.append(box_url.strip())
-
+            
         if progress_callback:
             progress_callback(15, "Downloading from Box...")
 
