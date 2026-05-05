@@ -1,34 +1,11 @@
 """
 ui_search.py - Main Streamlit entry point
 Uses multipage navigation (pages folder) and shared utilities from utils.py
-
-This Streamlit application provides a user-friendly web interface for searching
-indexed video segments. Users can:
-- Enter text queries to search across all indexed segments
-- Choose search mode (keyword, vector, or hybrid)
-- Filter results by video_id and adjust result count
-- View segment text with timestamps and relevance scores
-Architecture Role:
-- Frontend user interface for the video annotation system
-- Deployed as Azure Container App (video-annotator-ui)
-- Calls SearchSegments Azure Function for all search operations
-- Displays results with formatted timestamps and metadata
-Deployment:
-  - Local: python -m streamlit run ui_search.py
-  - Azure: Deployed as Container App (see ui/README.md)
-Configuration (via .env or Container App env vars):
-  - SEARCH_FN_URL: SearchSegments function endpoint
-  - MANAGE_LABELS_URL: ManageLabels function endpoint
-  - EVAL_LABELS_URL: EvalLabels function endpoint
-  - SEARCH_ENDPOINT: Azure AI Search endpoint
-  - SEARCH_KEY: Azure AI Search query key
-  - AZURE_STORAGE_ACCOUNT: Azure Storage account name
-  - AZURE_STORAGE_KEY: Azure Storage account key
-  - SPEECH_KEY: Azure Speech service key
 """
 
 import json
 import os
+import re
 import requests
 import streamlit as st
 from datetime import datetime, timezone, timedelta
@@ -71,6 +48,80 @@ defaults = {
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+
+# =============================================================================
+# BOX AUDIO HELPER — supports /s/{token} shared links
+# =============================================================================
+def fetch_box_audio_bytes_fixed(box_url: str) -> Optional[bytes]:
+    """
+    Fetch audio bytes from any Box shared URL for use in st.audio().
+    Handles both:
+      - /s/{token}  shared links  → append ?dl=1
+      - /file/{id}?s={token}      → try /content and index.php endpoints
+      - /shared/static/{hash}     → direct download
+    Returns None if all attempts fail or return HTML.
+    """
+    if not box_url:
+        return None
+
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(box_url.strip())
+        qs     = parse_qs(parsed.query)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+        url_lower = box_url.lower()
+
+        file_id_match = re.search(r'/file/(\d+)', parsed.path)
+        shared_token  = qs.get('s', [None])[0]
+        s_path_match  = re.match(r'/s/([^/?#]+)', parsed.path)
+
+        candidates = []
+
+        if s_path_match:
+            # /s/{token} — standard Box shared link: ?dl=1 forces download
+            s_token = s_path_match.group(1)
+            candidates.append(f"{base}/s/{s_token}?dl=1")
+            candidates.append(f"{base}/shared/static/{s_token}")
+
+        elif file_id_match and shared_token:
+            # /file/{id}?s={token} viewer links
+            file_id = file_id_match.group(1)
+            candidates.append(
+                f"{base}/index.php"
+                f"?rm=box_download_shared_file"
+                f"&file_id=f_{file_id}"
+                f"&shared_name={shared_token}"
+            )
+            candidates.append(f"{base}/file/{file_id}/content?s={shared_token}")
+
+        elif '/shared/static/' in url_lower:
+            candidates.append(box_url.strip())
+
+        else:
+            candidates.append(box_url.strip())
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+
+        for url in candidates:
+            try:
+                resp = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+                ct = resp.headers.get("Content-Type", "")
+                if resp.status_code == 200 and "text/html" not in ct:
+                    return resp.content
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    return None
 
 
 # =============================================================================
@@ -122,7 +173,7 @@ def call_search_api(payload: dict) -> dict:
 # =============================================================================
 # RESULT CARD RENDERER
 # =============================================================================
-def render_hit(i: int, h: dict, metadata_cache: dict) -> None:
+def render_hit(i: int, h: dict, metadata_cache: dict) -> dict:
     """Render a single search result card."""
     start_ms = h.get("start_ms", 0)
     end_ms   = h.get("end_ms",   0)
@@ -147,13 +198,13 @@ def render_hit(i: int, h: dict, metadata_cache: dict) -> None:
         vid, end_ms, source_url, source_type
     )
 
-    # Expander header — show truncated video ID + timestamp range + score
-    ts_range     = f"{ms_to_ts(start_ms)} → {ms_to_ts(end_ms)}"
-    display_vid  = vid if len(vid) < 28 else f"{vid[:25]}..."
-    score_str    = (f"  |  score={score:.3f}" if isinstance(score, (int, float))
-                    else f"  |  score={score}") if score is not None else ""
-    seg_str      = f"  |  seg={seg}" if seg else ""
-    header       = f"{i}. [{ts_range}]  {display_vid}{seg_str}{score_str}"
+    # Expander header
+    ts_range    = f"{ms_to_ts(start_ms)} → {ms_to_ts(end_ms)}"
+    display_vid = vid if len(vid) < 28 else f"{vid[:25]}..."
+    score_str   = (f"  |  score={score:.3f}" if isinstance(score, (int, float))
+                   else f"  |  score={score}") if score is not None else ""
+    seg_str     = f"  |  seg={seg}" if seg else ""
+    header      = f"{i}. [{ts_range}]  {display_vid}{seg_str}{score_str}"
 
     with st.expander(header, expanded=(i <= 3)):
 
@@ -178,18 +229,18 @@ def render_hit(i: int, h: dict, metadata_cache: dict) -> None:
 
         st.divider()
 
-        # ── Embedded Box player (starts at exact segment second) ──────────
-        # Box viewer URLs don't support ?t= deep-linking. Fetch bytes
-        # server-side via index.php (same endpoint used for transcription)
-        # and pass to st.audio with start_time.
+        # ── Audio preview ─────────────────────────────────────────────────
+        # Box URLs don't support time-based deep linking, so we fetch the
+        # audio bytes server-side and use st.audio with start_time.
         if source_url and not supports_time and link_type.startswith("Box"):
             start_sec = max(0, int(start_ms // 1000))
             end_sec   = int(end_ms // 1000) if end_ms and end_ms > start_ms else None
-            cache_key = f"box_bytes_{source_url}"
 
+            # Cache per source URL (not per segment — same file, different timestamps)
+            cache_key = f"box_bytes_{source_url}"
             if cache_key not in st.session_state:
-                with st.spinner("Loading audio…"):
-                    st.session_state[cache_key] = fetch_box_audio_bytes(source_url)
+                with st.spinner("Loading audio preview…"):
+                    st.session_state[cache_key] = fetch_box_audio_bytes_fixed(source_url)
 
             audio_bytes = st.session_state.get(cache_key)
             if audio_bytes:
@@ -199,9 +250,9 @@ def render_hit(i: int, h: dict, metadata_cache: dict) -> None:
                     start_time=start_sec,
                     end_time=end_sec,
                 )
-                st.caption(f"▶ Embedded player — starts at {ms_to_ts(start_ms)}")
+                st.caption(f"▶ Playing from {ms_to_ts(start_ms)} to {ms_to_ts(end_ms)}")
             else:
-                st.caption("⚠ Could not load audio preview — open Box link above")
+                st.warning("⚠ Could not load audio preview — open Box link below")
 
         # ── Link row ──────────────────────────────────────────────────────
         if start_link == "#":
@@ -211,15 +262,12 @@ def render_hit(i: int, h: dict, metadata_cache: dict) -> None:
 
             with link_cols[0]:
                 if link_type == "Box (download)":
-                    play_label = f"⬇️ Download Box video"
+                    play_label = "⬇️ Download Box file"
                 elif link_type.startswith("Box"):
-                    play_label = f"📦 Open in Box viewer"
+                    play_label = "📦 Open in Box viewer"
                 else:
                     play_label = f"▶️ Play from {ms_to_ts(start_ms)}"
-                st.markdown(
-                    f"**[{play_label}]({start_link})**",
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"**[{play_label}]({start_link})**", unsafe_allow_html=True)
                 st.caption(f"*{link_type}*")
 
             with link_cols[1]:
@@ -236,8 +284,6 @@ def render_hit(i: int, h: dict, metadata_cache: dict) -> None:
                 else:
                     st.caption("❌ No source URL")
 
-
-# Return stats for summary footer
     return {
         "source_origin": source_origin if source_url else "missing",
         "link_type":     link_type,
@@ -305,16 +351,16 @@ def render_search_page() -> None:
     if go:
         params = {"q": q.strip(), "mode": mode, "top": PAGE_SIZE}
         if mode in ("hybrid", "vector"):
-            params["k"] = None  # set dynamically per page based on skip
+            params["k"] = None
         if video_id_filter.strip():
             params["video_id"] = video_id_filter.strip()
         if selected_labels:
             params["labels"] = selected_labels
             params["label_match"] = label_match
         st.session_state['search_params']  = params
-        st.session_state['search_page']   = 0
-        st.session_state['search_hits']   = []
-        st.session_state['search_count']  = None
+        st.session_state['search_page']    = 0
+        st.session_state['search_hits']    = []
+        st.session_state['search_count']   = None
         st.session_state['search_loading'] = True
 
     params = st.session_state.get('search_params')
@@ -323,13 +369,13 @@ def render_search_page() -> None:
 
     page = st.session_state['search_page']
 
-    # ── Rerun 1: fetch and store, then trigger rerun 2 ────────────────────
+    # ── Fetch ─────────────────────────────────────────────────────────────
     if st.session_state['search_loading']:
-        with st.spinner("Loading..."):
+        with st.spinner("Searching…"):
             skip = page * PAGE_SIZE
             payload = {**params, "skip": skip}
             if payload.get("k") is None:
-                payload["k"] = min(skip + PAGE_SIZE, 200)
+                payload["k"] = min(skip + PAGE_SIZE * 4, 200)
             try:
                 data = call_search_api(payload)
             except Exception as e:
@@ -341,7 +387,7 @@ def render_search_page() -> None:
         st.session_state['search_loading'] = False
         st.rerun()
 
-    # ── Rerun 2: render from session_state (no fetch) ─────────────────────
+    # ── Render ────────────────────────────────────────────────────────────
     hits        = st.session_state['search_hits']
     total_count = st.session_state['search_count'] or 0
     total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -357,18 +403,14 @@ def render_search_page() -> None:
     type_counts    = {}
 
     for i, h in enumerate(hits, start=page * PAGE_SIZE + 1):
-        stats = render_hit(i, h, metadata_cache)
+        stats  = render_hit(i, h, metadata_cache)
         origin = stats["source_origin"]
-        if origin == "missing":
-            source_stats["missing"] += 1
-        elif origin == "cache":
-            source_stats["from_cache"] += 1
-        else:
-            source_stats["from_search"] += 1
+        source_stats["missing" if origin == "missing" else
+                     "from_cache" if origin == "cache" else "from_search"] += 1
         lt = stats["link_type"]
         type_counts[lt] = type_counts.get(lt, 0) + 1
 
-    # ── Pagination controls ───────────────────────────────────────────────
+    # ── Pagination ────────────────────────────────────────────────────────
     st.divider()
     nav_cols = st.columns([1, 2, 1])
     with nav_cols[0]:
@@ -405,11 +447,11 @@ def render_search_page() -> None:
 # =============================================================================
 # MULTIPAGE NAVIGATION
 # =============================================================================
-pg_search = st.Page(render_search_page, title="Search",             icon="🔎", default=True)
-pg_upload = st.Page("pages/1_Upload.py",             title="Upload",           icon="⬆️")
-pg_manage = st.Page("pages/2_Manage_Videos.py",      title="Manage Videos",    icon="📚")
-pg_labels = st.Page("pages/3_Label_Management.py",   title="Label Management", icon="🏷️")
-pg_eval   = st.Page("pages/4_Label_Evaluation.py",   title="Label Evaluation", icon="📊")
-pg_diag   = st.Page("pages/5_System_Diagnostics.py", title="System Diagnostics", icon="⚙️")
+pg_search = st.Page(render_search_page,                       title="Search",             icon="🔎", default=True)
+pg_upload = st.Page("pages/1_Upload.py",                      title="Upload",             icon="⬆️")
+pg_manage = st.Page("pages/2_Manage_Videos.py",               title="Manage Videos",      icon="📚")
+pg_labels = st.Page("pages/3_Label_Management.py",            title="Label Management",   icon="🏷️")
+pg_eval   = st.Page("pages/4_Label_Evaluation.py",            title="Label Evaluation",   icon="📊")
+pg_diag   = st.Page("pages/5_System_Diagnostics.py",          title="System Diagnostics", icon="⚙️")
 
 st.navigation([pg_search, pg_upload, pg_manage, pg_labels, pg_eval, pg_diag]).run()
