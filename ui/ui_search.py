@@ -51,80 +51,6 @@ for key, value in defaults.items():
 
 
 # =============================================================================
-# BOX AUDIO HELPER — supports /s/{token} shared links
-# =============================================================================
-def fetch_box_audio_bytes_fixed(box_url: str) -> Optional[bytes]:
-    """
-    Fetch audio bytes from any Box shared URL for use in st.audio().
-    Handles both:
-      - /s/{token}  shared links  → append ?dl=1
-      - /file/{id}?s={token}      → try /content and index.php endpoints
-      - /shared/static/{hash}     → direct download
-    Returns None if all attempts fail or return HTML.
-    """
-    if not box_url:
-        return None
-
-    try:
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(box_url.strip())
-        qs     = parse_qs(parsed.query)
-        base   = f"{parsed.scheme}://{parsed.netloc}"
-        url_lower = box_url.lower()
-
-        file_id_match = re.search(r'/file/(\d+)', parsed.path)
-        shared_token  = qs.get('s', [None])[0]
-        s_path_match  = re.match(r'/s/([^/?#]+)', parsed.path)
-
-        candidates = []
-
-        if s_path_match:
-            # /s/{token} — standard Box shared link: ?dl=1 forces download
-            s_token = s_path_match.group(1)
-            candidates.append(f"{base}/s/{s_token}?dl=1")
-            candidates.append(f"{base}/shared/static/{s_token}")
-
-        elif file_id_match and shared_token:
-            # /file/{id}?s={token} viewer links
-            file_id = file_id_match.group(1)
-            candidates.append(
-                f"{base}/index.php"
-                f"?rm=box_download_shared_file"
-                f"&file_id=f_{file_id}"
-                f"&shared_name={shared_token}"
-            )
-            candidates.append(f"{base}/file/{file_id}/content?s={shared_token}")
-
-        elif '/shared/static/' in url_lower:
-            candidates.append(box_url.strip())
-
-        else:
-            candidates.append(box_url.strip())
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-
-        for url in candidates:
-            try:
-                resp = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
-                ct = resp.headers.get("Content-Type", "")
-                if resp.status_code == 200 and "text/html" not in ct:
-                    return resp.content
-            except Exception:
-                continue
-
-    except Exception:
-        pass
-
-    return None
-
-
-# =============================================================================
 # METADATA CACHE
 # =============================================================================
 @st.cache_data(ttl=600)
@@ -231,16 +157,17 @@ def render_hit(i: int, h: dict, metadata_cache: dict) -> dict:
 
         # ── Audio preview ─────────────────────────────────────────────────
         # Box URLs don't support time-based deep linking, so we fetch the
-        # audio bytes server-side and use st.audio with start_time.
+        # audio bytes server-side (via utils.fetch_box_audio_bytes) and use
+        # st.audio with start_time. Cached per source URL so multiple segments
+        # from the same video don't re-download the file.
         if source_url and not supports_time and link_type.startswith("Box"):
             start_sec = max(0, int(start_ms // 1000))
             end_sec   = int(end_ms // 1000) if end_ms and end_ms > start_ms else None
 
-            # Cache per source URL (not per segment — same file, different timestamps)
             cache_key = f"box_bytes_{source_url}"
             if cache_key not in st.session_state:
                 with st.spinner("Loading audio preview…"):
-                    st.session_state[cache_key] = fetch_box_audio_bytes_fixed(source_url)
+                    st.session_state[cache_key] = fetch_box_audio_bytes(source_url)
 
             audio_bytes = st.session_state.get(cache_key)
             if audio_bytes:
